@@ -157,6 +157,31 @@ let cameras = [
 
 let camera = cameras[0];
 
+function generateSphere(numSegments = 8, numRings = 8) {
+    const vertices = [];
+    const indices = [];
+    for (let i = 0; i <= numRings; i++) {
+        const v = i / numRings;
+        const phi = v * Math.PI;
+        for (let j = 0; j <= numSegments; j++) {
+            const u = j / numSegments;
+            const theta = u * 2.0 * Math.PI;
+            const x = Math.sin(phi) * Math.cos(theta);
+            const y = Math.cos(phi);
+            const z = Math.sin(phi) * Math.sin(theta);
+            vertices.push(x, y, z);
+        }
+    }
+    for (let i = 0; i < numRings; i++) {
+        for (let j = 0; j < numSegments; j++) {
+            let a = i * (numSegments + 1) + j;
+            let b = a + numSegments + 1;
+            indices.push(a, b, a + 1, a + 1, b, b + 1);
+        }
+    }
+    return { vertices: new Float32Array(vertices), indices: new Uint32Array(indices) };
+}
+
 function getProjectionMatrix(fx, fy, width, height) {
     const znear = 0.2;
     const zfar = 200;
@@ -409,9 +434,20 @@ function createWorker(self) {
                 M[2] * M[2] + M[5] * M[5] + M[8] * M[8],
             ];
 
-            texdata[8 * i + 4] = packHalf2x16(4 * sigma[0], 4 * sigma[1]);
-            texdata[8 * i + 5] = packHalf2x16(4 * sigma[2], 4 * sigma[3]);
-            texdata[8 * i + 6] = packHalf2x16(4 * sigma[4], 4 * sigma[5]);
+            // texdata[8 * i + 4] = packHalf2x16(4 * sigma[0], 4 * sigma[1]);
+            // texdata[8 * i + 5] = packHalf2x16(4 * sigma[2], 4 * sigma[3]);
+            // texdata[8 * i + 6] = packHalf2x16(4 * sigma[4], 4 * sigma[5]);
+            // Compute approximate scales from the diagonal elements of sigma:
+            const sx = Math.sqrt(sigma[0])*.1;
+            const sy = Math.sqrt(sigma[3])*.1;
+            const sz = Math.sqrt(sigma[5])*.1;
+
+            // Store scale factors (sx, sy, sz) into the texture instead of raw sigma values.
+            // For now, we put sx, sy on the first line, sz on the second line.
+            // You can later adjust the second half of these packHalf2x16 calls to store rotation data or keep them as 0.
+            texdata[8 * i + 4] = packHalf2x16(sx, sy);
+            texdata[8 * i + 5] = packHalf2x16(sz, 0.0);
+            texdata[8 * i + 6] = packHalf2x16(0.0, 0.0);
         }
 
         self.postMessage({ texdata, texwidth, texheight }, [texdata.buffer]);
@@ -549,8 +585,11 @@ function createWorker(self) {
         // IJKL - quaternion/rot (uint8)
         const rowLength = 3 * 4 + 3 * 4 + 4 + 4;
         const buffer = new ArrayBuffer(rowLength * vertexCount);
+        
 
         console.time("build buffer");
+        const OPACITY_THRESHOLD = 0.1; // Add this line near the start of processPlyBuffer if desired
+        let validGaussians = [];
         for (let j = 0; j < vertexCount; j++) {
             row = sizeIndex[j];
 
@@ -659,77 +698,83 @@ precision highp int;
 
 uniform highp usampler2D u_texture;
 uniform mat4 projection, view;
-uniform vec2 focal;
-uniform vec2 viewport;
 
-in vec2 position;
-in int index;
+in vec3 position;
 
 out vec4 vColor;
-out vec2 vPosition;
+
+vec4 quatRotate(vec4 q, vec3 v) {
+    // Rotate vector v by quaternion q
+    vec3 qv = q.xyz;
+    float w = q.w;
+    vec3 t = 2.0 * cross(qv, v);
+    vec3 vPrime = v + w * t + cross(qv, t);
+    return vec4(vPrime, 1.0);
+}
 
 void main () {
-    uvec4 cen = texelFetch(u_texture, ivec2((uint(index) & 0x3ffu) << 1, uint(index) >> 10), 0);
-    vec4 cam = view * vec4(uintBitsToFloat(cen.xyz), 1);
-    vec4 pos2d = projection * cam;
+    // gl_InstanceID is used to fetch the instance data
+    uint index = uint(gl_InstanceID);
 
-    float clip = 1.2 * pos2d.w;
-    if (pos2d.z < -clip || pos2d.x < -clip || pos2d.x > clip || pos2d.y < -clip || pos2d.y > clip) {
-        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        return;
-    }
+    // Fetch center and color
+    uvec4 cen = texelFetch(u_texture, ivec2((index & 0x3ffu) << 1, index >> 10), 0);
+    uvec4 cov = texelFetch(u_texture, ivec2(((index & 0x3ffu) << 1) | 1u, index >> 10), 0);
 
-    uvec4 cov = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 1) | 1u, uint(index) >> 10), 0);
-    vec2 u1 = unpackHalf2x16(cov.x), u2 = unpackHalf2x16(cov.y), u3 = unpackHalf2x16(cov.z);
-    mat3 Vrk = mat3(u1.x, u1.y, u2.x, u1.y, u2.y, u3.x, u2.x, u3.x, u3.y);
-
-    mat3 J = mat3(
-        focal.x / cam.z, 0., -(focal.x * cam.x) / (cam.z * cam.z),
-        0., -focal.y / cam.z, (focal.y * cam.y) / (cam.z * cam.z),
-        0., 0., 0.
+    vec3 center = vec3(uintBitsToFloat(cen.x), uintBitsToFloat(cen.y), uintBitsToFloat(cen.z));
+    vec4 color = vec4(
+        float((cov.w) & 0xffu)/255.0,
+        float((cov.w >> 8) & 0xffu)/255.0,
+        float((cov.w >>16) & 0xffu)/255.0,
+        float((cov.w >>24) & 0xffu)/255.0
     );
 
-    mat3 T = transpose(mat3(view)) * J;
-    mat3 cov2d = transpose(T) * Vrk * T;
+    // Decode scale and rotation from cov texture:
+    // Original code computed a covariance matrix for Gaussian splats.
+    // Now, we assume the same logic that your worker uses: scale stored in sigma and quat in rot.
+    // Here, we replicate that logic minimally.
+    vec2 u1 = unpackHalf2x16(cov.x);
+    vec2 u2 = unpackHalf2x16(cov.y);
+    vec2 u3 = unpackHalf2x16(cov.z);
 
-    float mid = (cov2d[0][0] + cov2d[1][1]) / 2.0;
-    float radius = length(vec2((cov2d[0][0] - cov2d[1][1]) / 2.0, cov2d[0][1]));
-    float lambda1 = mid + radius, lambda2 = mid - radius;
+    // Interpret these as scale and quaternion:
+    // Assume from your existing data encoding:
+    // u1.x, u1.y, u2.x -> scales (sx, sy, sz)
+    // u2.y, u3.x, u3.y -> quaternion x,y,z
+    float sx = u1.x; 
+    float sy = u1.y; 
+    float sz = u2.x; 
+    float qx = u2.y * 2.0 - 1.0;
+    float qy = u3.x * 2.0 - 1.0;
+    float qz = u3.y * 2.0 - 1.0;
+    float w = sqrt(max(0.0, 1.0 - qx*qx - qy*qy - qz*qz));
 
-    if(lambda2 < 0.0) return;
-    vec2 diagonalVector = normalize(vec2(cov2d[0][1], lambda1 - cov2d[0][0]));
-    vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector;
-    vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x);
+    vec4 q = vec4(qx, qy, qz, w);
 
-    vColor = clamp(pos2d.z/pos2d.w+1.0, 0.0, 1.0) * vec4((cov.w) & 0xffu, (cov.w >> 8) & 0xffu, (cov.w >> 16) & 0xffu, (cov.w >> 24) & 0xffu) / 255.0;
-    vPosition = position;
+    // Rotate and scale the unit sphere to create the ellipsoid
+    vec3 scaledPos = vec3(position.x * sx, position.y * sy, position.z * sz);
+    vec3 rotatedPos = (quatRotate(q, scaledPos)).xyz;
+    vec4 worldPos = vec4(rotatedPos + center, 1.0);
+    vec4 viewPos = view * worldPos;
+    vec4 clipPos = projection * viewPos;
 
-    vec2 vCenter = vec2(pos2d) / pos2d.w;
-    gl_Position = vec4(
-        vCenter
-        + position.x * majorAxis / viewport
-        + position.y * minorAxis / viewport, 0.0, 1.0);
-
+    vColor = color;
+    gl_Position = clipPos;
 }
 `.trim();
+
 
 const fragmentShaderSource = `
 #version 300 es
 precision highp float;
 
 in vec4 vColor;
-in vec2 vPosition;
-
 out vec4 fragColor;
 
 void main () {
-    float A = -dot(vPosition, vPosition);
-    if (A < -4.0) discard;
-    float B = exp(A) * vColor.a;
-    fragColor = vec4(B * vColor.rgb, B);
+    fragColor = vColor; // Solid ellipsoid color
 }
-
 `.trim();
+
 
 let defaultViewMatrix = [
     0.47, 0.04, 0.88, 0, -0.11, 0.99, 0.02, 0, -0.88, -0.11, 0.47, 0, 0.07,
@@ -804,17 +849,21 @@ async function main() {
     if (!gl.getProgramParameter(program, gl.LINK_STATUS))
         console.error(gl.getProgramInfoLog(program));
 
-    gl.disable(gl.DEPTH_TEST); // Disable depth testing
+    // gl.disable(gl.DEPTH_TEST); // Disable depth testing
 
-    // Enable blending
-    gl.enable(gl.BLEND);
-    gl.blendFuncSeparate(
-        gl.ONE_MINUS_DST_ALPHA,
-        gl.ONE,
-        gl.ONE_MINUS_DST_ALPHA,
-        gl.ONE,
-    );
-    gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
+    // // Enable blending
+    // gl.enable(gl.BLEND);
+    // gl.blendFuncSeparate(
+    //     gl.ONE_MINUS_DST_ALPHA,
+    //     gl.ONE,
+    //     gl.ONE_MINUS_DST_ALPHA,
+    //     gl.ONE,
+    // );
+    // gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
+
+    gl.enable(gl.DEPTH_TEST);  // Enable depth testing
+    gl.disable(gl.BLEND);      // Disable blending for solid ellipsoids
+
 
     const u_projection = gl.getUniformLocation(program, "projection");
     const u_viewport = gl.getUniformLocation(program, "viewport");
@@ -822,14 +871,29 @@ async function main() {
     const u_view = gl.getUniformLocation(program, "view");
 
     // positions
-    const triangleVertices = new Float32Array([-2, -2, 2, -2, 2, 2, -2, 2]);
-    const vertexBuffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, triangleVertices, gl.STATIC_DRAW);
+    // const triangleVertices = new Float32Array([-2, -2, 2, -2, 2, 2, -2, 2]);
+    // const vertexBuffer = gl.createBuffer();
+    // gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+    // gl.bufferData(gl.ARRAY_BUFFER, triangleVertices, gl.STATIC_DRAW);
+    // const a_position = gl.getAttribLocation(program, "position");
+    // gl.enableVertexAttribArray(a_position);
+    // gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+    // gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+    // Replace old quad attribute setup with the sphere setup:
+    const { vertices: sphereVertices, indices: sphereIndices } = generateSphere();
+    const sphereVBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, sphereVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, sphereVertices, gl.STATIC_DRAW);
+
+    const sphereEBO = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, sphereEBO);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphereIndices, gl.STATIC_DRAW);
+
+    // Now a_position should point to the 3D sphere coordinates:
     const a_position = gl.getAttribLocation(program, "position");
     gl.enableVertexAttribArray(a_position);
-    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
-    gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(a_position, 3, gl.FLOAT, false, 0, 0);
 
     var texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -1359,7 +1423,10 @@ async function main() {
             document.getElementById("spinner").style.display = "none";
             gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
             gl.clear(gl.COLOR_BUFFER_BIT);
-            gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+            // gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+            // new:
+            gl.drawElementsInstanced(gl.TRIANGLES, sphereIndices.length, gl.UNSIGNED_INT, 0, vertexCount);
+
         } else {
             gl.clear(gl.COLOR_BUFFER_BIT);
             document.getElementById("spinner").style.display = "";
